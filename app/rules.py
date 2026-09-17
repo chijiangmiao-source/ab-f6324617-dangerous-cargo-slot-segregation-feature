@@ -1,5 +1,6 @@
 """隔离规则与裁决逻辑（纯函数，不依赖 Web 层）。"""
 
+from collections.abc import Iterator
 from dataclasses import dataclass
 from typing import Sequence
 
@@ -83,3 +84,104 @@ def adjudicate(containers: Sequence[Container]) -> AdjudicationResult:
         pairs_compared=pairs_compared,
         first_conflict=None if first is None else first[1],
     )
+
+
+@dataclass(frozen=True)
+class SlotRecommendation:
+    """寻位结果：无可用位置时 position/search_distance 均为 None。"""
+
+    position: Position | None
+    search_distance: int | None
+
+
+def _shell_positions(
+    bounds: tuple[int, int, int],
+    expected: Position,
+    distance: int,
+    occupied: set[Position],
+) -> Iterator[Position]:
+    """逐个产出与期望点曼哈顿距离恰为 distance 的舱内、未占用坐标。
+
+    按 (排, 列, 层) 字典序升序产出，因此同壳层无需再排序；
+    只枚举该壳层上的点（壳层规模 O(d^2)），不物化整个舱段网格，
+    大尺寸稀疏舱段同样廉价。
+    """
+    max_row, max_col, max_tier = bounds
+    exp_row, exp_col, exp_tier = expected
+
+    row_lo = max(1, exp_row - distance)
+    row_hi = min(max_row, exp_row + distance)
+    for row in range(row_lo, row_hi + 1):
+        # 固定排后，列、层还需分摊的绝对差之和。
+        remain = distance - abs(row - exp_row)
+        col_lo = max(1, exp_col - remain)
+        col_hi = min(max_col, exp_col + remain)
+        for col in range(col_lo, col_hi + 1):
+            delta_tier = remain - abs(col - exp_col)
+            # 层差固定为 ±delta_tier（为 0 时只有一个点），天然按升序。
+            tiers = (
+                (exp_tier - delta_tier, exp_tier + delta_tier)
+                if delta_tier
+                else (exp_tier,)
+            )
+            for tier in tiers:
+                position = (row, col, tier)
+                if 1 <= tier <= max_tier and position not in occupied:
+                    yield position
+
+
+def _is_safe_for(
+    position: Position,
+    cargo_category: str,
+    containers: Sequence[Container],
+) -> bool:
+    """待装箱在该坐标是否对全部现存箱达到最小隔离距离。
+
+    只判断待装箱与各现存箱之间的关系，不复查现存箱彼此之间的隔离。
+    距离恰好等于要求即安全（与裁决口径一致：低一格才不行）。
+    """
+    row, col, tier = position
+    for other in containers:
+        actual = (
+            abs(row - other.row)
+            + abs(col - other.col)
+            + abs(tier - other.tier)
+        )
+        if actual < required_distance(cargo_category, other.category):
+            return False
+    return True
+
+
+def recommend_slot(
+    containers: Sequence[Container],
+    cargo_category: str,
+    expected: Position,
+    bounds: tuple[int, int, int],
+) -> SlotRecommendation:
+    """从期望点按曼哈顿距离逐层向外寻找首个安全箱位。
+
+    * 第 0 层即期望点本身；每层只生成舱内坐标并跳过已占用位置；
+    * 同层坐标按 (排, 列, 层) 字典序依次检验，取首个对全部现存箱
+      都满足最小距离者——结果只取决于舱段状态，与现存箱输入顺序无关；
+    * 不物化完整网格：逐壳层枚举，枚举到的点才做安全判定；
+    * 直到最远的舱内壳层（期望点到舱角的最大曼哈顿距离）仍无候选时，
+      返回无可用位置。
+    """
+    max_row, max_col, max_tier = bounds
+    occupied = {_position(container) for container in containers}
+
+    # 期望点到舱段任一格的最大可能曼哈顿距离：再往外没有舱内坐标。
+    max_distance = (
+        max(expected[0] - 1, max_row - expected[0])
+        + max(expected[1] - 1, max_col - expected[1])
+        + max(expected[2] - 1, max_tier - expected[2])
+    )
+
+    for search_distance in range(max_distance + 1):
+        for position in _shell_positions(
+            bounds, expected, search_distance, occupied
+        ):
+            if _is_safe_for(position, cargo_category, containers):
+                return SlotRecommendation(position, search_distance)
+
+    return SlotRecommendation(None, None)
