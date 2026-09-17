@@ -1,0 +1,29 @@
+services:
+  api:
+    build: .
+    image: dangerous-goods-adjudicator:1.0.0
+    # API_PORT 仅覆盖宿主机映射端口；容器内固定监听 8000。
+    ports:
+      - "${API_PORT:-8000}:8000"
+    healthcheck:
+      test: ["CMD", "python", "/app/scripts/healthcheck.py"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+      start_period: 5s
+    restart: unless-stopped
+
+  # 一次性验收服务：启动 -> 对 api 执行全部验收用例 -> 退出（退出码即结论）。
+  # 放在独立 profile 中：默认 `docker compose up` 只启动常驻 api，
+  # verify 正常退出（exit 0）不会导致默认启动命令报错。
+  # 显式运行：docker compose --profile verify run --rm verify
+  verify:
+    image: dangerous-goods-adjudicator:1.0.0
+    profiles: ["verify"]
+    depends_on:
+      api:
+        condition: service_healthy
+    environment:
+      VERIFY_BASE_URL: http://api:8000
+    entrypoint: ["python", "/app/scripts/verify.py"]
+    restart: "no"
