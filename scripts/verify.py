@@ -11,7 +11,10 @@
 * 临界再低一格 -> 唯一冲突，返回证据由本脚本独立按曼哈顿距离复算；
 * 多冲突时首项按 (较小箱位, 较大箱位) 排序，且与输入顺序无关；
 * 全部非法输入（尺寸非正、越界、重复、未知类别、缺字段、多字段）整份 422；
-* 无冲突时返回比较对数 C(n, 2)。
+* 无冲突时返回比较对数 C(n, 2)；
+* 推荐接口 /api/v1/recommend-slot：期望点被占或不安全时按曼哈顿壳层
+  向外搜索，最近层并列取 (排, 列, 层) 字典序首位且与输入顺序无关，
+  小舱无解返回无坐标的 no_safe_slot，非法请求整份 422。
 
 环境变量：
     VERIFY_BASE_URL  被测服务地址，默认 http://api:8000（Compose 网络）。
@@ -29,6 +32,7 @@ import httpx
 
 BASE_URL = os.environ.get("VERIFY_BASE_URL", "http://api:8000").rstrip("/")
 ENDPOINT = f"{BASE_URL}/api/v1/adjudicate"
+RECOMMEND_ENDPOINT = f"{BASE_URL}/api/v1/recommend-slot"
 HEALTHCHECK_SCRIPT = Path(__file__).resolve().parent / "healthcheck.py"
 TIMEOUT = 10.0
 
@@ -129,6 +133,65 @@ def expect_422(client: httpx.Client, name: str, body: Any) -> None:
         check(f"{name} [无任何裁决字段]",
               "status" not in data and "first_conflict" not in data
               and "pairs_compared" not in data and "detail" in data,
+              str(data))
+
+
+def recommend_layout(containers: list[dict[str, Any]], category: str,
+                     desired: dict[str, int], **sizes: Any) -> dict[str, Any]:
+    return {
+        "max_row": sizes.get("max_row", 20),
+        "max_col": sizes.get("max_col", 20),
+        "max_tier": sizes.get("max_tier", 10),
+        "containers": containers,
+        "category": category,
+        "desired": desired,
+    }
+
+
+def expect_recommended(client: httpx.Client, name: str, body: dict[str, Any],
+                       slot: dict[str, int], distance: int) -> dict[str, Any] | None:
+    response = client.post(RECOMMEND_ENDPOINT, json=body, timeout=TIMEOUT)
+    check(f"{name} [HTTP 200]", response.status_code == 200,
+          f"got {response.status_code} {response.text}")
+    if response.status_code != 200:
+        return None
+    data = response.json()
+    check(f"{name} [status=recommended]", data.get("status") == "recommended", str(data))
+    check(f"{name} [推荐坐标={slot} 且搜索距离={distance}]",
+          data.get("slot") == slot and data.get("distance") == distance, str(data))
+    if data.get("slot") is not None:
+        # 验收侧独立复算：推荐坐标与期望坐标的曼哈顿距离应等于搜索距离。
+        recomputed = manhattan(data["slot"], body["desired"])
+        check(f"{name} [搜索距离可独立复算]", recomputed == distance,
+              f"复算 {recomputed} != 返回 {data.get('distance')}")
+        # 推荐坐标不得与任何现存箱位重叠。
+        overlap = any(
+            manhattan(data["slot"], c) == 0 for c in body["containers"]
+        )
+        check(f"{name} [推荐坐标未占用]", not overlap, str(data))
+    return data
+
+
+def expect_no_safe_slot(client: httpx.Client, name: str, body: dict[str, Any]) -> None:
+    response = client.post(RECOMMEND_ENDPOINT, json=body, timeout=TIMEOUT)
+    check(f"{name} [HTTP 200]", response.status_code == 200,
+          f"got {response.status_code} {response.text}")
+    if response.status_code != 200:
+        return
+    data = response.json()
+    check(f"{name} [status=no_safe_slot 且不含坐标]",
+          data == {"status": "no_safe_slot"}, str(data))
+
+
+def expect_recommend_422(client: httpx.Client, name: str, body: Any) -> None:
+    response = client.post(RECOMMEND_ENDPOINT, json=body, timeout=TIMEOUT)
+    check(f"{name} [HTTP 422]", response.status_code == 422,
+          f"got {response.status_code} {response.text}")
+    if response.status_code == 422:
+        data = response.json()
+        check(f"{name} [无任何推荐字段]",
+              "status" not in data and "slot" not in data
+              and "distance" not in data and "detail" in data,
               str(data))
 
 
@@ -246,13 +309,101 @@ def main() -> int:
         expect_422(client, "顶层含未声明字段", {**good, "ship": "x"})
         expect_422(client, "空 JSON", {})
 
+        print("\n[6] 推荐接口：最近安全箱位搜索")
+        # 空舱：期望点本身即可用，搜索距离 0。
+        expect_recommended(client, "空舱推荐期望点本身",
+                           recommend_layout([], "A", {"row": 5, "col": 5, "tier": 3}),
+                           {"row": 5, "col": 5, "tier": 3}, distance=0)
+        # 期望点被占：向外一层，字典序最小者。
+        expect_recommended(client, "期望点被同类占用 -> 距离 1 壳层首位",
+                           recommend_layout([box(5, 5, 3, "D")], "A",
+                                            {"row": 5, "col": 5, "tier": 3}),
+                           {"row": 4, "col": 5, "tier": 3}, distance=1)
+        # 候选须对全部现存箱安全：C(5,5,2) 要求 2、B(4,5,3) 要求 3，
+        # 期望点与距离 1 壳层均不安全，距离 2 壳层首位为 (5,3,3)。
+        expect_recommended(client, "候选须同时满足全部现存箱的隔离要求",
+                           recommend_layout([box(5, 5, 2, "C"), box(4, 5, 3, "B")],
+                                            "A", {"row": 5, "col": 5, "tier": 3}),
+                           {"row": 5, "col": 3, "tier": 3}, distance=2)
+
+        print("\n[7] 推荐接口：最近层并列取字典序首位，且与输入顺序无关")
+        # 期望点 (2,2,2) 被 C 占用（A-C 要求 2）：距离 1 壳层全部不安全，
+        # 距离 2 壳层 12 个候选并列，字典序首位为 (1,1,2)；
+        # 两个 D 与待装 A 要求 1，仅用于制造多种输入顺序。
+        tied = recommend_layout(
+            [box(2, 2, 2, "C"), box(3, 3, 3, "D"), box(3, 3, 1, "D")],
+            "A", {"row": 2, "col": 2, "tier": 2},
+            max_row=3, max_col=3, max_tier=3)
+        first = expect_recommended(client, "并列层取字典序首位 (1,1,2)",
+                                   tied, {"row": 1, "col": 1, "tier": 2}, distance=2)
+        reversed_response = client.post(
+            RECOMMEND_ENDPOINT,
+            json={**tied, "containers": list(reversed(tied["containers"]))},
+            timeout=TIMEOUT)
+        check("逆序输入返回完全相同的推荐 JSON",
+              reversed_response.status_code == 200 and reversed_response.json() == first,
+              f"{reversed_response.text} != {first}")
+
+        print("\n[8] 推荐接口：小舱无解返回无坐标状态")
+        # 2x2x1 小舱，B 占 (1,1,1)，待装 A：A-B 要求 3，
+        # 舱内任意点到 (1,1,1) 的距离至多为 2，全部不安全。
+        expect_no_safe_slot(client, "小舱无安全位置 -> no_safe_slot 且无坐标",
+                            recommend_layout([box(1, 1, 1, "B")], "A",
+                                             {"row": 2, "col": 2, "tier": 1},
+                                             max_row=2, max_col=2, max_tier=1))
+        expect_no_safe_slot(client, "舱位全部被占 -> no_safe_slot",
+                            recommend_layout(
+                                [box(r, c, 1, "D") for r in (1, 2) for c in (1, 2)],
+                                "D", {"row": 1, "col": 1, "tier": 1},
+                                max_row=2, max_col=2, max_tier=1))
+
+        print("\n[9] 推荐接口：非法请求整份 422")
+        rec_good = recommend_layout([], "A", {"row": 5, "col": 5, "tier": 3})
+        expect_recommend_422(client, "期望坐标低于下界",
+                             {**rec_good, "desired": {"row": 0, "col": 5, "tier": 3}})
+        expect_recommend_422(client, "期望坐标超出舱段",
+                             {**rec_good, "desired": {"row": 21, "col": 5, "tier": 3}})
+        expect_recommend_422(client, "期望层超出舱段",
+                             {**rec_good, "desired": {"row": 5, "col": 5, "tier": 11}})
+        expect_recommend_422(client, "期望坐标类型错误",
+                             {**rec_good, "desired": {"row": "5", "col": 5, "tier": 3}})
+        expect_recommend_422(client, "期望坐标缺字段",
+                             {**rec_good, "desired": {"row": 5, "col": 5}})
+        expect_recommend_422(client, "期望坐标含未声明字段",
+                             {**rec_good,
+                              "desired": {"row": 5, "col": 5, "tier": 3, "deck": 1}})
+        expect_recommend_422(client, "未知待装类别 E", {**rec_good, "category": "E"})
+        expect_recommend_422(client, "小写待装类别 a", {**rec_good, "category": "a"})
+        expect_recommend_422(client, "尺寸非正", {**rec_good, "max_row": 0})
+        expect_recommend_422(client, "现存箱越界",
+                             recommend_layout([box(21, 1, 1, "A")], "A",
+                                              {"row": 5, "col": 5, "tier": 3}))
+        expect_recommend_422(client, "现存箱重复占位",
+                             recommend_layout([box(1, 1, 1, "A"), box(1, 1, 1, "B")],
+                                              "A", {"row": 5, "col": 5, "tier": 3}))
+        expect_recommend_422(client, "现存箱未知类别",
+                             recommend_layout([box(1, 1, 1, "E")], "A",
+                                              {"row": 5, "col": 5, "tier": 3}))
+        expect_recommend_422(client, "缺少 desired 字段",
+                             {k: v for k, v in rec_good.items() if k != "desired"})
+        expect_recommend_422(client, "缺少 category 字段",
+                             {k: v for k, v in rec_good.items() if k != "category"})
+        expect_recommend_422(client, "顶层含未声明字段", {**rec_good, "ship": "x"})
+        expect_recommend_422(client, "空 JSON", {})
+        expect_recommend_422(client, "越界+重复+未知类别+期望越界同时出现",
+                             recommend_layout(
+                                 [box(99, 1, 1, "A"), box(1, 1, 1, "A"),
+                                  box(1, 1, 1, "B")],
+                                 "E", {"row": 99, "col": 1, "tier": 1}))
+
     print(f"\n共执行 {checks_run} 项检查。")
     if failures:
         print(f"验收失败：{len(failures)} 项未通过。")
         for item in failures:
             print(f"  - {item}")
         return 1
-    print("验收通过：全部临界距离合规，低一格冲突唯一且可复算，非法输入整份 422。")
+    print("验收通过：全部临界距离合规，低一格冲突唯一且可复算，非法输入整份 422；"
+          "推荐接口壳层搜索、并列字典序、无解状态与整份 422 均符合预期。")
     return 0
 
 
